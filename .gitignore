@@ -1,0 +1,18 @@
+# Environment & credentials
+.env
+credentials.json
+token.json
+
+# Intermediate files - always regenerated
+.tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db

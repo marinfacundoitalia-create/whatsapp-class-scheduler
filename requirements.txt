@@ -1,0 +1,18 @@
+# Web framework
+flask==3.1.0
+
+# AI/NLP - Claude API
+anthropic>=0.42.0
+
+# Google Calendar API
+google-api-python-client>=2.160.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1
+
+# Utilities
+python-dotenv>=1.0.1
+requests>=2.32.0
+pytz>=2024.2
+
+# Production server
+gunicorn>=23.0.0
