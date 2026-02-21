@@ -231,3 +231,24 @@ PORT                    - Server port (default: 5000)
 - Rate limiting: 0.5s minimum between consecutive API calls to avoid undocumented rate limits.
 - Auth endpoint: `https://api.playtomic.io/v3/auth/login` — uses email/password, returns JWT.
 - Response field names vary between camelCase and snake_case — always check both patterns.
+- **CRITICAL**: The `/v1/classes` endpoint requires `tenant_id` (SINGULAR), NOT `tenant_ids` (plural).
+  Using `tenant_ids` silently returns classes from random clubs worldwide instead of filtering to your club.
+  The `/v1/availability` endpoint uses `tenant_id` too. Always use the singular form.
+- Class prices from the API come as strings like "10 EUR" or "0 MXN" — must parse both amount and currency.
+- Classes have two types: `PRIVATE` (1-on-1 lessons with a coach) and `COURSE` (group classes with max_players).
+- User bookings endpoint: `GET /v1/matches?user_id={id}` — NOT `/v1/users/{id}/matches` (404).
+- Resource names are NOT in the availability response — must fetch separately from `GET /v1/tenants/{id}`.
+- **CRITICAL**: The payment intent body requires nested structure: `cart.requested_item.cart_item_data` —
+  NOT a flat `cart` object. The flat format returns 400 with a Jackson deserialization error.
+- Step 2 uses **PATCH** (not PUT — PUT returns 405) with field `selected_payment_method_id` (not `selected_payment_method`).
+- `pay_now` in `match_registrations` must be `true` — `false` causes server 500.
+- `cart_item_type` must be `CUSTOMER_MATCH` — `MANAGER_MATCH` and `PRIVATE_LESSON` cause 500.
+- Payment method auto-selection: the server returns `available_payment_methods` in Step 1. The code picks
+  the best one in preference order: CASH > MERCHANT_WALLET > OFFER > DIRECT > QUICK_PAY > ...
+- **SETUP REQUIRED**: Club must have at least one onsite payment method (Cash/Bizum) configured in
+  Playtomic Manager > Settings > Onsite Payment Methods. Without this, `QUICK_PAY` is the only available
+  method, which requires user interaction in the Playtomic app (not suitable for bot automation).
+  With `CASH` enabled, bookings can be confirmed automatically without any user payment action.
+- There is NO separate manager API for creating bookings. All booking creation goes through the
+  consumer API's 3-step payment intent flow, even for TENANT_MANAGER accounts.
+- Cancel booking: `POST /v1/matches/{id}/cancel` (empty body). Cancellation policy is 24h before for padel.

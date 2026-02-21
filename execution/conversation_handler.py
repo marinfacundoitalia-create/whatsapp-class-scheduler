@@ -783,9 +783,8 @@ def _handle_playtomic_schedule(phone_number: str, entities: dict, sender_name: s
         f"I found a court for you:\n\n"
         f"  *{slot['resource_name']}*\n"
         f"  {_format_date(date_str)}\n"
-        f"  {_format_time(time_str)} ({duration} min)\n"
-        f"  {slot['currency']} {slot['price']:.2f}\n\n"
-        f"Reply *yes* to book or *no* to cancel."
+        f"  {_format_time(time_str)} ({duration} min)\n\n"
+        f"Reply *yes* to reserve or *no* to cancel."
     )
 
 
@@ -799,6 +798,9 @@ def _handle_playtomic_enroll(phone_number: str, entities: dict) -> str:
         logger.error(f"Playtomic classes fetch failed: {e}")
         return "I'm having trouble checking Playtomic classes right now. Please try again."
 
+    # Filter to group classes only (COURSE), exclude private 1-on-1 lessons
+    classes = [c for c in classes if c.get("class_type") == "COURSE"]
+
     if not classes:
         return "There are no upcoming group classes at the club right now."
 
@@ -811,10 +813,13 @@ def _handle_playtomic_enroll(phone_number: str, entities: dict) -> str:
     # Single class found — offer directly
     if len(classes) == 1:
         cls = classes[0]
+        duration = cls.get("duration_minutes", 60)
         operation_data = {
             "class_id": cls["class_id"],
             "class_name": cls["name"],
             "start_time": cls["start_time"].isoformat(),
+            "end_time": cls["end_time"].isoformat(),
+            "duration_minutes": duration,
             "price": cls["price"],
             "currency": cls.get("currency", "EUR"),
         }
@@ -823,20 +828,21 @@ def _handle_playtomic_enroll(phone_number: str, entities: dict) -> str:
         return (
             f"Found a class:\n\n"
             f"  *{cls['name']}*\n"
-            f"  {cls['start_time'].strftime('%A, %b %d')} at {cls['start_time'].strftime('%I:%M %p')}\n"
+            f"  {cls['start_time'].strftime('%A, %b %d')} at {cls['start_time'].strftime('%I:%M %p')}"
+            f" ({duration} min)\n"
             f"  Instructor: {cls.get('instructor', 'TBD')}\n"
-            f"  Spots: {cls['spots_available']}/{cls['spots_total']}\n"
-            f"  Price: {cls.get('currency', 'EUR')} {cls['price']:.2f}\n\n"
+            f"  Spots: {cls['spots_available']}/{cls['spots_total']}\n\n"
             f"Reply *yes* to enroll or *no* to skip."
         )
 
     # Multiple classes: list them
     lines = []
     for i, cls in enumerate(classes[:6], 1):
+        duration = cls.get("duration_minutes", 60)
         lines.append(
             f"{i}. *{cls['name']}* - "
             f"{cls['start_time'].strftime('%a %b %d %I:%M %p')} "
-            f"({cls['spots_available']} spots, {cls.get('currency', 'EUR')} {cls['price']:.2f})"
+            f"({duration}min, {cls['spots_available']} spots)"
         )
 
     return (
@@ -921,8 +927,7 @@ def _handle_playtomic_availability(entities: dict) -> str:
     for slot in slots[:8]:
         time_fmt = slot["start_time"].strftime("%I:%M %p").lstrip("0")
         lines.append(
-            f"  {time_fmt} - {slot['resource_name']} "
-            f"({slot['duration_minutes']}min, {slot['currency']} {slot['price']:.2f})"
+            f"  {time_fmt} - {slot['resource_name']} ({slot['duration_minutes']}min)"
         )
 
     remaining = len(slots) - 8
@@ -1047,13 +1052,11 @@ def _execute_playtomic_book_court(phone_number: str, data: dict) -> str:
         clear_pending_operation(phone_number)
 
         return (
-            f"Court booked!\n\n"
+            f"Court reserved!\n\n"
             f"  *{data['resource_name']}*\n"
             f"  {_format_date(data['date'])}\n"
-            f"  {_format_time(data['time'])} ({data['duration']} min)\n"
-            f"  {data['currency']} {data['price']:.2f}\n\n"
-            f"Booking ID: {result['booking_id'][:8]}...\n"
-            f"To cancel, just message me."
+            f"  {_format_time(data['time'])} ({data['duration']} min)\n\n"
+            f"To cancel or change, just message me."
         )
     except PlaytomicSlotTakenError:
         clear_pending_operation(phone_number)
@@ -1078,13 +1081,20 @@ def _execute_playtomic_enroll_class(phone_number: str, data: dict) -> str:
     try:
         result = pt_enroll_in_class(class_id=data["class_id"])
 
+        # Use end_time from class data, or compute from duration
+        end_time = data.get("end_time", "")
+        if not end_time and data.get("start_time"):
+            start_dt = datetime.fromisoformat(data["start_time"])
+            duration = data.get("duration_minutes", 60)
+            end_time = (start_dt + timedelta(minutes=duration)).isoformat()
+
         save_playtomic_booking(
             phone_number=phone_number,
             match_id=result["enrollment_id"],
             resource_name=data["class_name"],
             booking_type="class",
             start_time=data["start_time"],
-            end_time="",
+            end_time=end_time,
             price=data["price"],
             currency=data["currency"],
         )
@@ -1094,12 +1104,13 @@ def _execute_playtomic_enroll_class(phone_number: str, data: dict) -> str:
         start = datetime.fromisoformat(data["start_time"])
         if start.tzinfo is None:
             start = TZ.localize(start)
+        duration = data.get("duration_minutes", 60)
 
         return (
             f"Enrolled!\n\n"
             f"  *{data['class_name']}*\n"
-            f"  {start.strftime('%A, %b %d')} at {start.strftime('%I:%M %p')}\n"
-            f"  {data['currency']} {data['price']:.2f}\n\n"
+            f"  {start.strftime('%A, %b %d')} at {start.strftime('%I:%M %p')}"
+            f" ({duration} min)\n\n"
             f"See you there!"
         )
     except PlaytomicBookingError as e:
@@ -1150,8 +1161,7 @@ def _suggest_playtomic_alternatives(requested_dt: datetime, duration: int) -> st
     for slot in slots[:4]:
         time_fmt = slot["start_time"].strftime("%I:%M %p").lstrip("0")
         lines.append(
-            f"  {time_fmt} - {slot['resource_name']} "
-            f"({slot['currency']} {slot['price']:.2f})"
+            f"  {time_fmt} - {slot['resource_name']} ({slot['duration_minutes']}min)"
         )
 
     return (

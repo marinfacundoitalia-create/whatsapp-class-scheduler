@@ -34,10 +34,12 @@ BASE_URL = "https://api.playtomic.io/v1"
 # Auth endpoint — reverse-engineered from Playtomic web/mobile app
 AUTH_URL = "https://api.playtomic.io/v3/auth/login"
 
-# Default request headers (mimic the Playtomic app)
+# Default request headers (mimic the Playtomic mobile app)
 DEFAULT_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
+    "Accept-Language": "en",
+    "User-Agent": "Playtomic/1.0",
 }
 
 # ── In-memory token storage (single owner account) ──
@@ -471,7 +473,7 @@ def get_upcoming_classes(
         from_date = tz.localize(from_date)
 
     params = {
-        "tenant_ids": PLAYTOMIC_TENANT_ID,
+        "tenant_id": PLAYTOMIC_TENANT_ID,  # singular — "tenant_ids" returns random clubs
         "sport_id": PLAYTOMIC_SPORT_ID,
         "from_start_date": from_date.strftime("%Y-%m-%dT%H:%M:%S"),
         "status": status,
@@ -514,9 +516,15 @@ def get_upcoming_classes(
         except (ValueError, TypeError):
             continue
 
+        # Calculate duration in minutes from start/end
+        duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
+
         # Extract instructor name
         coaches = item.get("coaches", [])
         instructor = coaches[0].get("name", "TBD") if coaches else "TBD"
+
+        # Determine class type (COURSE = group, PRIVATE = private lesson)
+        class_type = item.get("type", "COURSE")
 
         # Extract registration/spots info
         reg = item.get("registration_info") or item.get("registrationInfo") or {}
@@ -525,14 +533,19 @@ def get_upcoming_classes(
         registered = reg.get("registered_players") or reg.get("registeredPlayers", 0)
         spots_available = max(0, max_players - registered) if max_players else 0
 
-        # Extract price
-        raw_price = item.get("price") or reg.get("price") or 0
+        # Extract price — API returns either a dict, a string like "10 EUR", or a number
+        raw_price = reg.get("price") or item.get("price") or 0
         if isinstance(raw_price, dict):
             price = float(raw_price.get("amount", 0))
             currency = raw_price.get("currency", "EUR")
         elif isinstance(raw_price, str):
-            price = float(raw_price.split()[0]) if raw_price else 0
-            currency = "EUR"
+            # Parse strings like "10 EUR", "0 MXN", "85 EUR"
+            parts = raw_price.strip().split()
+            try:
+                price = float(parts[0]) if parts else 0
+            except ValueError:
+                price = 0
+            currency = parts[1] if len(parts) > 1 else "EUR"
         else:
             price = float(raw_price)
             currency = "EUR"
@@ -540,8 +553,10 @@ def get_upcoming_classes(
         classes.append({
             "class_id": item.get("academy_class_id") or item.get("id") or "unknown",
             "name": course.get("name") or item.get("name") or "Class",
+            "class_type": class_type,  # "COURSE" or "PRIVATE"
             "start_time": start_dt,
             "end_time": end_dt,
+            "duration_minutes": duration_minutes,
             "instructor": instructor,
             "spots_available": spots_available,
             "spots_total": max_players,
@@ -615,13 +630,20 @@ def get_upcoming_lessons(
         except (ValueError, TypeError):
             continue
 
+        # Calculate duration in minutes
+        duration_minutes = int((end_dt - start_dt).total_seconds() / 60)
+
         raw_price = item.get("price", 0)
         if isinstance(raw_price, dict):
             price = float(raw_price.get("amount", 0))
             currency = raw_price.get("currency", "EUR")
         elif isinstance(raw_price, str):
-            price = float(raw_price.split()[0]) if raw_price else 0
-            currency = "EUR"
+            parts = raw_price.strip().split()
+            try:
+                price = float(parts[0]) if parts else 0
+            except ValueError:
+                price = 0
+            currency = parts[1] if len(parts) > 1 else "EUR"
         else:
             price = float(raw_price)
             currency = "EUR"
@@ -631,6 +653,7 @@ def get_upcoming_lessons(
             "name": item.get("tournament_name") or item.get("name") or "Lesson",
             "start_time": start_dt,
             "end_time": end_dt,
+            "duration_minutes": duration_minutes,
             "instructor": "TBD",
             "spots_available": item.get("available_places") or item.get("availablePlaces") or 0,
             "spots_total": item.get("max_players") or item.get("maxPlayers") or 0,
@@ -645,6 +668,15 @@ def get_upcoming_lessons(
 # Booking (3-Step Payment Intent Flow)
 # ══════════════════════════════════════════════
 
+# Preferred payment methods in order of preference.
+# CASH first — owner books on behalf of clients, no online payment.
+_PAYMENT_METHOD_PREFERENCE = [
+    "CASH", "MERCHANT_WALLET", "OFFER", "DIRECT",
+    "QUICK_PAY", "CREDIT_CARD", "WALLET",
+    "IDEAL", "BANCONTACT", "PAYTRAIL", "SWISH",
+]
+
+
 def create_booking(
     resource_id: str,
     start_time: datetime,
@@ -655,14 +687,17 @@ def create_booking(
     Book a court using the 3-step payment intent flow.
 
     Step 1: POST /payment_intents — create
-    Step 2: PUT  /payment_intents/{id} — set payment method
+    Step 2: PATCH /payment_intents/{id} — set payment method
     Step 3: POST /payment_intents/{id}/confirmation — confirm
+
+    The payment method is auto-selected from the server's available
+    methods using _PAYMENT_METHOD_PREFERENCE order (CASH first).
 
     Args:
         resource_id: The court/resource UUID.
         start_time: Booking start (timezone-aware datetime).
         duration_minutes: Slot duration (default 90 for padel).
-        payment_method_id: Payment method UUID. None = use wallet/default.
+        payment_method_id: Override payment method. None = auto-select.
 
     Returns:
         {
@@ -681,10 +716,11 @@ def create_booking(
         PlaytomicBookingError: On any step failure.
     """
     # Step 1: Create payment intent
-    pi_id = _create_payment_intent(resource_id, start_time, duration_minutes)
+    pi_id, available_methods = _create_payment_intent(resource_id, start_time, duration_minutes)
 
-    # Step 2: Set payment method
-    _set_payment_method(pi_id, payment_method_id)
+    # Step 2: Select best available payment method
+    method = payment_method_id or _pick_best_payment_method(available_methods)
+    _set_payment_method(pi_id, method)
 
     # Step 3: Confirm
     result = _confirm_payment_intent(pi_id)
@@ -693,16 +729,53 @@ def create_booking(
     return result
 
 
+def _pick_best_payment_method(available_methods: list) -> str:
+    """
+    Choose the best payment method from what the server offers.
+    Prefers CASH (no online charge) then falls back through preference list.
+
+    Args:
+        available_methods: List of dicts with 'payment_method_id' keys.
+
+    Returns:
+        The chosen payment_method_id string.
+
+    Raises:
+        PlaytomicBookingError: If no compatible method is available.
+    """
+    available_ids = {m.get("payment_method_id") for m in available_methods}
+
+    for preferred in _PAYMENT_METHOD_PREFERENCE:
+        if preferred in available_ids:
+            logger.info(f"Selected payment method: {preferred}")
+            return preferred
+
+    # If none of our preferences match, use whatever's available
+    if available_ids:
+        fallback = next(iter(available_ids))
+        logger.warning(f"No preferred payment method found; using fallback: {fallback}")
+        return fallback
+
+    raise PlaytomicBookingError(
+        "No payment methods available for this club. "
+        "Enable 'Cash' as an onsite payment method in Playtomic Manager > Settings.",
+        step="set_payment",
+    )
+
+
 def _create_payment_intent(
     resource_id: str,
     start_time: datetime,
     duration_minutes: int,
-) -> str:
+) -> tuple:
     """
     Step 1: Create a payment intent for the court booking.
 
+    The cart body uses nested structure: cart.requested_item.cart_item_data
+    (discovered via reverse-engineered Go CLI and Laravel SDK).
+
     Returns:
-        payment_intent_id (str)
+        (payment_intent_id, available_payment_methods) tuple.
 
     Raises:
         PlaytomicSlotTakenError: If the slot is already taken (409).
@@ -712,15 +785,34 @@ def _create_payment_intent(
     if start_time.tzinfo is None:
         start_time = tz.localize(start_time)
 
+    user_id = get_user_id()
+
     body = {
-        "allowed_payment_method_types": ["OFFER", "CASH", "MERCHANT_WALLET", "DIRECT", "SWISH", "IDEAL", "BANCONTACT", "PAYTRAIL", "WALLET"],
-        "user_id": get_user_id(),
+        "allowed_payment_method_types": [
+            "OFFER", "CASH", "MERCHANT_WALLET", "DIRECT",
+            "SWISH", "IDEAL", "BANCONTACT", "PAYTRAIL",
+            "CREDIT_CARD", "QUICK_PAY", "WALLET",
+        ],
+        "user_id": user_id,
         "cart": {
-            "tenant_id": PLAYTOMIC_TENANT_ID,
-            "sport_id": PLAYTOMIC_SPORT_ID,
-            "resource_id": resource_id,
-            "start": start_time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "duration": duration_minutes,
+            "requested_item": {
+                "cart_item_type": "CUSTOMER_MATCH",
+                "cart_item_voucher_id": None,
+                "cart_item_data": {
+                    "supports_split_payment": True,
+                    "number_of_players": 4,
+                    "tenant_id": PLAYTOMIC_TENANT_ID,
+                    "resource_id": resource_id,
+                    "start": start_time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "duration": duration_minutes,
+                    "match_registrations": [
+                        {
+                            "user_id": user_id,
+                            "pay_now": False,  # Owner account — no real payment
+                        }
+                    ],
+                },
+            },
         },
     }
 
@@ -753,8 +845,12 @@ def _create_payment_intent(
             step="create_intent",
         )
 
-    logger.info(f"Payment intent created: {pi_id}")
-    return pi_id
+    available_methods = data.get("available_payment_methods", [])
+    logger.info(
+        f"Payment intent created: {pi_id} | "
+        f"Available methods: {[m.get('payment_method_id') for m in available_methods]}"
+    )
+    return pi_id, available_methods
 
 
 def _set_payment_method(
@@ -763,7 +859,10 @@ def _set_payment_method(
 ) -> bool:
     """
     Step 2: Attach a payment method to the payment intent.
-    Uses WALLET as default if no specific method is provided.
+    Uses PATCH with selected_payment_method_id field.
+
+    The payment_method_id should come from _pick_best_payment_method()
+    which auto-selects from the server's available_payment_methods list.
 
     Returns:
         True on success.
@@ -771,14 +870,17 @@ def _set_payment_method(
     Raises:
         PlaytomicBookingError: On failure.
     """
+    if not payment_method_id:
+        raise PlaytomicBookingError("No payment method specified.", step="set_payment")
+
     body = {
-        "selected_payment_method_type": payment_method_id or "WALLET",
+        "selected_payment_method_id": payment_method_id,
     }
 
     _rate_limit()
 
     try:
-        resp = requests.put(
+        resp = requests.patch(
             f"{BASE_URL}/payment_intents/{payment_intent_id}",
             json=body,
             headers=_get_headers(),
@@ -832,9 +934,23 @@ def _confirm_payment_intent(payment_intent_id: str) -> dict:
     data = resp.json()
     tz = pytz.timezone(CALENDAR_TIMEZONE)
 
-    # Parse the result defensively
-    start_raw = data.get("start_date") or data.get("start") or ""
-    end_raw = data.get("end_date") or data.get("end") or ""
+    # The confirmation response may nest match data inside cart.item.cart_item_data
+    # Try nested path first, then fall back to flat fields
+    cart_item = {}
+    cart = data.get("cart") or {}
+    item = cart.get("item") or {}
+    if item.get("cart_item_data"):
+        cart_item = item["cart_item_data"]
+
+    # Parse the result defensively — check nested path first, then flat
+    start_raw = (
+        cart_item.get("start_date") or cart_item.get("start") or
+        data.get("start_date") or data.get("start") or ""
+    )
+    end_raw = (
+        cart_item.get("end_date") or cart_item.get("end") or
+        data.get("end_date") or data.get("end") or ""
+    )
 
     try:
         start_dt = datetime.fromisoformat(start_raw)
@@ -850,14 +966,22 @@ def _confirm_payment_intent(payment_intent_id: str) -> dict:
     except (ValueError, TypeError):
         end_dt = None
 
+    # Extract match_id from nested or flat response
+    booking_id = (
+        cart_item.get("match_id") or
+        data.get("match_id") or data.get("id") or payment_intent_id
+    )
+
     return {
-        "booking_id": data.get("match_id") or data.get("id") or payment_intent_id,
+        "booking_id": booking_id,
         "payment_intent_id": payment_intent_id,
-        "resource_name": data.get("court_name") or data.get("resource_name") or "Court",
+        "resource_name": _get_resource_name(
+            cart_item.get("resource_id") or data.get("resource_id") or ""
+        ),
         "start_time": start_dt,
         "end_time": end_dt,
-        "price": float(data.get("price") or data.get("amount") or 0),
-        "currency": data.get("currency", "EUR"),
+        "price": float(cart_item.get("price") or data.get("price") or data.get("amount") or 0),
+        "currency": data.get("currency") or cart_item.get("currency", "EUR"),
         "status": data.get("status", "CONFIRMED"),
     }
 

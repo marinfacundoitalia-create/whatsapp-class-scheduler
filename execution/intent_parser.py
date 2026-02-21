@@ -270,6 +270,22 @@ def _fallback_parse(message_text: str) -> dict:
     # Set duration based on sub_type
     duration = 90 if sub_type == "court" else 60
 
+    # If we matched a known intent, give reasonable confidence so the
+    # conversation handler routes it instead of asking for clarification.
+    # Only truly unknown intents should trigger clarification.
+    if intent != "unknown":
+        return {
+            "intent": intent,
+            "entities": {
+                "duration_minutes": duration,
+                "service": service,
+                "sub_type": sub_type,
+            },
+            "confidence": 0.75,
+            "clarification_needed": False,
+            "clarification_question": None,
+        }
+
     return {
         "intent": intent,
         "entities": {
@@ -280,11 +296,12 @@ def _fallback_parse(message_text: str) -> dict:
         "confidence": 0.3,
         "clarification_needed": True,
         "clarification_question": (
-            "I'm having trouble understanding. Could you tell me what you'd like to do?\n\n"
+            "I'm not sure what you need. Here are some things I can help with:\n\n"
             "*Private classes:*\n"
             '  "Schedule a class tomorrow at 3pm"\n\n'
             "*Playtomic (courts & club):*\n"
             '  "Book a court Saturday at 5pm"\n'
-            '  "Show me group classes"'
+            '  "Show me group classes"\n'
+            '  "Show my schedule"'
         ),
     }
