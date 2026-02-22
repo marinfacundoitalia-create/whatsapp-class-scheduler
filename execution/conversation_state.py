@@ -61,6 +61,29 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_events_google_id
                 ON scheduled_events(google_event_id);
+
+            CREATE TABLE IF NOT EXISTS playtomic_bookings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_number TEXT NOT NULL,
+                match_id TEXT NOT NULL UNIQUE,
+                resource_name TEXT,
+                booking_type TEXT NOT NULL DEFAULT 'court',
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                price REAL DEFAULT 0,
+                currency TEXT DEFAULT 'EUR',
+                status TEXT DEFAULT 'CONFIRMED',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pt_bookings_phone
+                ON playtomic_bookings(phone_number);
+
+            CREATE INDEX IF NOT EXISTS idx_pt_bookings_match
+                ON playtomic_bookings(match_id);
+
+            CREATE INDEX IF NOT EXISTS idx_pt_bookings_status
+                ON playtomic_bookings(status);
         """)
         conn.commit()
         logger.info("Database initialized successfully.")
@@ -331,6 +354,128 @@ def find_user_event_by_date(phone_number: str, date_str: str) -> list:
         ).fetchall()
 
         return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+# ──────────────────────────────────────────────
+# 24-Hour Window Check
+# ──────────────────────────────────────────────
+
+# ──────────────────────────────────────────────
+# Playtomic Bookings (WhatsApp user ↔ Playtomic match mapping)
+# ──────────────────────────────────────────────
+
+def save_playtomic_booking(
+    phone_number: str,
+    match_id: str,
+    resource_name: str,
+    booking_type: str,
+    start_time: str,
+    end_time: str = "",
+    price: float = 0,
+    currency: str = "EUR",
+):
+    """
+    Link a WhatsApp user to a Playtomic booking.
+
+    Args:
+        phone_number: User's WhatsApp number
+        match_id: Playtomic match/booking UUID
+        resource_name: Court name or class name
+        booking_type: "court" or "class"
+        start_time: ISO format start time
+        end_time: ISO format end time
+        price: Booking price
+        currency: Currency code (default EUR)
+    """
+    now = datetime.utcnow().isoformat()
+    conn = _get_connection()
+    try:
+        conn.execute(
+            """INSERT OR REPLACE INTO playtomic_bookings
+               (phone_number, match_id, resource_name, booking_type,
+                start_time, end_time, price, currency, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'CONFIRMED', ?)""",
+            (phone_number, match_id, resource_name, booking_type,
+             start_time, end_time, price, currency, now),
+        )
+        conn.commit()
+        logger.info(f"Playtomic booking {match_id} saved for {phone_number}")
+    finally:
+        conn.close()
+
+
+def get_user_playtomic_bookings(phone_number: str) -> list:
+    """Get all active (confirmed, future) Playtomic bookings for a user."""
+    now = datetime.utcnow().isoformat()
+    conn = _get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM playtomic_bookings
+               WHERE phone_number = ?
+               AND status = 'CONFIRMED'
+               AND start_time > ?
+               ORDER BY start_time ASC""",
+            (phone_number, now),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def find_user_playtomic_booking_by_date(phone_number: str, date_str: str) -> list:
+    """
+    Find a user's Playtomic bookings on a specific date.
+
+    Args:
+        phone_number: User's WhatsApp number
+        date_str: Date in YYYY-MM-DD format
+
+    Returns:
+        List of matching booking dicts.
+    """
+    conn = _get_connection()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM playtomic_bookings
+               WHERE phone_number = ?
+               AND status = 'CONFIRMED'
+               AND start_time LIKE ?
+               ORDER BY start_time ASC""",
+            (phone_number, f"{date_str}%"),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def delete_playtomic_booking(match_id: str):
+    """Mark a Playtomic booking as cancelled (soft delete for audit trail)."""
+    now = datetime.utcnow().isoformat()
+    conn = _get_connection()
+    try:
+        conn.execute(
+            """UPDATE playtomic_bookings
+               SET status = 'CANCELLED'
+               WHERE match_id = ?""",
+            (match_id,),
+        )
+        conn.commit()
+        logger.info(f"Playtomic booking {match_id} marked as cancelled")
+    finally:
+        conn.close()
+
+
+def get_playtomic_booking_by_match_id(match_id: str) -> dict:
+    """Find a Playtomic booking by its match ID."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM playtomic_bookings WHERE match_id = ?",
+            (match_id,),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
